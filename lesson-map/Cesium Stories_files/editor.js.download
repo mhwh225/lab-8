@@ -1,0 +1,212 @@
+/* global Quill */
+let ready = false;
+let imageCredentialsEndpoint;
+
+const quill = new Quill("#editor", {
+  theme: "snow",
+  modules: {
+    toolbar: {
+      container: [
+        { size: ["small", false, "large", "huge"] },
+        "bold",
+        "italic",
+        "link",
+        "image",
+        { list: "ordered" },
+        { list: "bullet" },
+        "clean",
+      ],
+      handlers: { image: imageHandler },
+    },
+    clipboard: {
+      matchers: [
+        [
+          Node.ELEMENT_NODE,
+          function (node, delta) {
+            // Replace non-url-base images with alt text
+            // This case should be impossible until
+            // quill adds support, but it's here as a precaution
+            // to prevent massive data uris in case there's something we missed.
+            // When this is possible, we can upload and self-host instead of
+            // allowing data urls.
+            if (node instanceof Image && !/^http/.test(node.src)) {
+              const alt = isStringEmpty(node.alt) ? "image" : node.alt;
+              delta.ops = [
+                {
+                  insert: `[ ${alt} ]`,
+                },
+              ];
+              return delta;
+            }
+
+            // We want to control text color, so remove color and background ops
+            // Also remove code block formatting to prevent large horizontal text.
+            // All content will still be pasted, just without this formatting.
+            delta.ops.forEach((op) => {
+              if (typeof op.attributes === "object") {
+                delete op.attributes.color;
+                delete op.attributes.background;
+                delete op.attributes.code;
+                delete op.attributes["code-block"];
+              }
+            });
+            return delta;
+          },
+        ],
+      ],
+    },
+  },
+});
+
+// Event handler to post events back to webcomponent
+quill.on("text-change", () => {
+  if (ready) {
+    parent.postMessage(
+      { value: quill.getContents() },
+      window.location.origin,
+      []
+    );
+  }
+});
+
+window.addEventListener("message", (e) => {
+  ready = true;
+  if (e.data.imageCredentialsEndpoint) {
+    imageCredentialsEndpoint = e.data.imageCredentialsEndpoint;
+    return;
+  }
+
+  const contents = e.data.value;
+  if (typeof contents !== "object") {
+    quill.setContents("");
+  } else {
+    quill.setContents(contents);
+  }
+});
+
+function isStringEmpty(value) {
+  if (value === null || typeof value === "undefined") {
+    return true;
+  }
+  return /^\s*$/g.test(value);
+}
+
+// Disable use of PageUp/PageDown keys on Chrome.
+// See https://github.com/CesiumGS/cesium-ion/issues/4899
+const fields = / Chrome\/([\.0-9]+)/.exec(navigator.userAgent);
+if (fields !== null) {
+  document.querySelector(".ql-editor").addEventListener(
+    "keydown",
+    (e) => {
+      if (e.key === "PageUp" || e.key === "PageDown") {
+        e.stopPropagation();
+        e.preventDefault();
+      }
+    },
+    true
+  );
+}
+
+/**
+ * Uploads user selected image to be hosted by ion.
+ * @param {FILE} file The image file to be uploaded.
+ */
+async function postImage(file) {
+  // Request temporary upload credentials from ion
+  const searchParams = new URLSearchParams();
+  searchParams.set("type", file.type);
+  const credentialsResponse = await fetch(
+    `${imageCredentialsEndpoint}?${searchParams.toString()}`,
+    {
+      credentials: "include",
+    }
+  );
+
+  //Generate a form post with the response
+  const credentialsResponseJson = await credentialsResponse.json();
+  const formData = new FormData();
+  Object.entries(credentialsResponseJson.fields).forEach(([k, v]) => {
+    formData.append(k, v);
+  });
+  formData.append("file", file);
+
+  //Post the image directly to S3 (or whatever backend was dictated by the server)
+  const postResponse = await fetch(credentialsResponseJson.url, {
+    method: "POST",
+    body: formData, // body data type must match "Content-Type" header
+  });
+
+  // If the server rejected it for some reason, parse the XML error returned.
+  if (!postResponse.ok) {
+    const data = new window.DOMParser().parseFromString(
+      await postResponse.text(),
+      "text/xml"
+    );
+    const errorMessage = data.getElementsByTagName("Message")[0].textContent;
+    parent.postMessage({ error: errorMessage }, window.location.origin, []);
+  }
+
+  // Return the server generate url for the image.
+  return credentialsResponseJson.assetsUrl;
+}
+
+function imageHandler() {
+  // Create and execute a temporary input element;
+  const input = document.createElement("input");
+  input.setAttribute("type", "file");
+  input.setAttribute("accept", "image/png,image/jpeg,image/gif");
+  input.click();
+
+  input.onchange = async () => {
+    // The server does these two checks as well, but catching them
+    // early is easier and allows for us to provide better error messages
+    const file = input.files[0];
+    if (!/^image\/(png|jpeg|gif)$/.test(file.type)) {
+      parent.postMessage(
+        {
+          error:
+            "Unsupported image format: Try again with a GIF, JPEG, JPG or PNG.",
+        },
+        window.location.origin,
+        []
+      );
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      // 10MB
+      parent.postMessage(
+        { error: "Images must be under 10 MB." },
+        window.location.origin,
+        []
+      );
+      return;
+    }
+
+    // Save current cursor state
+    const range = quill.getSelection(true);
+
+    // Insert temporary loading placeholder image
+    quill.insertEmbed(range.index, "image", "placeholder.gif");
+
+    let url;
+    try {
+      url = await postImage(file);
+    } catch (e) {
+      parent.postMessage(
+        {
+          error: "Failed to insert image. Check your connection and try again.",
+        },
+        window.location.origin,
+        []
+      );
+    }
+
+    // Remove placeholder
+    quill.deleteText(range.index, 1);
+
+    if (url) {
+      quill.insertEmbed(range.index, "image", url);
+    }
+  };
+}
